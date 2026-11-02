@@ -1,0 +1,72 @@
+{
+  "shared-playback": {
+    "main/CMakeLists.txt": {
+      "before": [
+        "2b59798a153d3e160a09cb679fafb19fca61120bce23245c17666e5777a8329b",
+        "6d500c061cd4483a5726e1254c3a66224d144969ed1594397b4ffba2a8d32994",
+        "df37a0a9937780223f972e1a1884d01118b870a63fb6c9ced6e26116b93d5426"
+      ]
+    },
+    "main/application.cc": {
+      "before": [
+        "452f87692581fa44c44f1f6e027d14911c397af39dca9e9200b543157acfd7f9",
+        "d6970a4148d9246726ca9d0685ce37b04500bb92fb79e5522024323f51f81451"
+      ]
+    },
+    "main/application.h": {
+      "before": [
+        "71bfebd37b279b7f07832b80620cd15829e996b2942555ec09e23599464879cc"
+      ]
+    },
+    "main/audio/audio_codec.cc": {
+      "before": [
+        "2dafab53ce88f6aa66ff0cc51eb23da73dac8f034276636c3cf491e304443072"
+      ]
+    },
+    "main/audio/audio_codec.h": {
+      "before": [
+        "6f6d681762a9f5c556fe45de69df92f29c39b116dad82e8a9f7ea5c88cd95858"
+      ]
+    },
+    "main/audio/audio_service.cc": {
+      "before": [
+        "956f1c1228648036ff582e768b1a09c4c7e811e2500885a9a91ada6debf0e1d1"
+      ]
+    },
+    "main/audio/audio_service.h": {
+      "before": [
+        "ac09ce91a4a83129efeaa611501d74e100c6d103d4c203d83aaef9fd8a8ebb94"
+      ]
+    },
+    "main/audio/codecs/no_audio_codec.cc": {
+      "before": [
+        "4e9d0f9325e9d39b8791f39dcd2952236be5ec4fbf8bd940b825044d21b6cc81"
+      ]
+    },
+    "main/audio/codecs/no_audio_codec.h": {
+      "before": [
+        "5c8e83d329ebabd796306a931787b4003828dff21b57b491d8a24813feb136bf"
+      ]
+    }
+  },
+  "sounds": {
+    "main/CMakeLists.txt": {
+      "before": [
+        "208e98e1a02b1ed0efbce923452b1c552d6a3c2d587b0f641135799781d63a3e",
+        "561cb330babdf8cbb594aacd07a67e5ab2850f52394f039f5d06d61b4000c414",
+        "93e4443bffccbdbbba9e78f7ea3b3228f662071ab5dec55558c3c9f680b849de"
+      ]
+    },
+    "main/application.cc": {
+      "before": [
+        "94238c4147dbb37bb118a24e36d94f0d5654db19bbbec6711367310b01f1a1ac",
+        "c17b7bafed8550532f63b764257fd173eabab97384ca3548b6f38d54e91bd97a"
+      ]
+    },
+    "main/application.h": {
+      "before": [
+        "c75d41bfbc74f621f3b32411d6085d8a3863ba040b40bcf55a24b58208f377c1"
+      ]
+    }
+  }
+}

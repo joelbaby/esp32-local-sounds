@@ -1,0 +1,42 @@
+--- a/main/CMakeLists.txt
++++ b/main/CMakeLists.txt
+@@ -91,7 +91,9 @@
+ 
+ # Select the board source directory from Kconfig
+ # Set default assets if the board uses partition table V2
+-if(CONFIG_BOARD_TYPE_BREAD_COMPACT_WIFI)
++if(CONFIG_BOARD_TYPE_POCKET_SOUNDS_C3)
++    set(BOARD_DIR "pocket-sounds-c3")
++elseif(CONFIG_BOARD_TYPE_BREAD_COMPACT_WIFI)
+     set(BOARD_DIR "bread-compact-wifi")
+     set(BUILTIN_TEXT_FONT font_noto_sans_basic_14_1)
+     set(BUILTIN_ICON_FONT font_material_symbols_14_1)
+--- a/main/Kconfig.projbuild
++++ b/main/Kconfig.projbuild
+@@ -442,6 +442,9 @@
+     config BOARD_TYPE_OTTO_ROBOT
+         bool "Otto Robot"
+         depends on IDF_TARGET_ESP32S3
++    config BOARD_TYPE_POCKET_SOUNDS_C3
++        bool "Pocket C3 sound example (specific wiring)"
++        depends on IDF_TARGET_ESP32C3
+     config BOARD_TYPE_QUANDONG_S3_DEV_2_8_LCD
+         bool "Quandong ESP32-S3 2.8-inch SPI LCD (全动 2.8寸)"
+         depends on IDF_TARGET_ESP32S3
+--- a/main/application.cc
++++ b/main/application.cc
+@@ -515,7 +515,13 @@
+         retry_count = 0;
+         retry_delay = 10;  // Reset retry delay
+ 
+-        if (ota_->HasNewVersion()) {
++        // Preserve this custom board identity while retaining discovery/activation.
++        if (ota_->HasNewVersion()
++#ifndef CONFIG_BOARD_TYPE_POCKET_SOUNDS_C3
++            ) {
++#else
++            && false) {
++#endif
+             if (UpgradeFirmware(ota_->GetFirmwareUrl(), ota_->GetFirmwareVersion())) {
+                 return;  // This line will never be reached after reboot
+             }

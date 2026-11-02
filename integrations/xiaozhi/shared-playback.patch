@@ -1,0 +1,693 @@
+--- a/main/CMakeLists.txt
++++ b/main/CMakeLists.txt
+@@ -2,6 +2,7 @@
+ set(SOURCES "audio/audio_codec.cc"
+             "audio/audio_debugger.cc"
+             "audio/audio_service.cc"
++            "audio/local_audio_adapter.cc"
+             "audio/demuxer/ogg_demuxer.cc"
+             "notify/notify_player.cc"
+             "audio/codecs/no_audio_codec.cc"
+--- a/main/application.cc
++++ b/main/application.cc
+@@ -61,7 +61,21 @@
+     vEventGroupDelete(event_group_);
+ }
+ 
+-bool Application::SetDeviceState(DeviceState state) { return state_machine_.TransitionTo(state); }
++bool Application::SetDeviceState(DeviceState state) {
++    const auto before = GetDeviceState();
++    const bool changed = state_machine_.TransitionTo(state);
++    if (changed && state == kDeviceStateListening && before != kDeviceStateListening) {
++        recognized_user_turn_.fetch_add(1);
++        if (!generated_auto_listening_transition_) local_awaiting_user_.store(false);
++    }
++    if (state == kDeviceStateUpgrading || state == kDeviceStateWifiConfiguring ||
++        state == kDeviceStateFatalError || state == kDeviceStateActivating ||
++        state == kDeviceStateAudioTesting) {
++        generated_resume_allowed_.store(false);
++        StopLocalPlayback();
++    }
++    return changed;
++}
+ 
+ void Application::Initialize() {
+     auto& board = Board::GetInstance();
+@@ -88,13 +102,20 @@
+         xEventGroupSetBits(event_group_, MAIN_EVENT_WAKE_WORD_DETECTED);
+     };
+     callbacks.on_vad_change = [this](bool speaking) {
++        if (speaking) ObserveLocalVoiceActivity();
+         xEventGroupSetBits(event_group_, MAIN_EVENT_VAD_CHANGE);
++    };
++    callbacks.on_input_activity = [this](const std::vector<int16_t>& pcm) {
++        ObserveLocalInputActivity(pcm);
+     };
+     callbacks.on_playback_drained = [this]() {
+         xEventGroupSetBits(event_group_, MAIN_EVENT_PLAYBACK_DRAINED);
+     };
+     callbacks.on_playback_progress = [this](uint32_t playback_id, uint32_t media_position_ms) {
+         notify_player_.OnPlaybackProgress(playback_id, media_position_ms);
++    };
++    callbacks.on_local_audio_finished = [this]() {
++        xEventGroupSetBits(event_group_, MAIN_EVENT_GENERATED_AUDIO);
+     };
+     audio_service_.SetCallbacks(callbacks);
+ 
+@@ -192,12 +213,18 @@
+         MAIN_EVENT_VAD_CHANGE | MAIN_EVENT_CLOCK_TICK | MAIN_EVENT_ERROR |
+         MAIN_EVENT_NETWORK_CONNECTED | MAIN_EVENT_NETWORK_DISCONNECTED | MAIN_EVENT_TOGGLE_CHAT |
+         MAIN_EVENT_START_LISTENING | MAIN_EVENT_STOP_LISTENING | MAIN_EVENT_ACTIVATION_DONE |
+-        MAIN_EVENT_STATE_CHANGED | MAIN_EVENT_PLAYBACK_DRAINED | MAIN_EVENT_STARTUP_HINT_TIMEOUT;
++        MAIN_EVENT_STATE_CHANGED | MAIN_EVENT_PLAYBACK_DRAINED | MAIN_EVENT_STARTUP_HINT_TIMEOUT |
++        MAIN_EVENT_GENERATED_AUDIO;
+ 
+     while (true) {
+         auto bits = xEventGroupWaitBits(event_group_, ALL_EVENTS, pdTRUE, pdFALSE, portMAX_DELAY);
+ 
++        if (bits & MAIN_EVENT_GENERATED_AUDIO)
++            HandleLocalPlaybackEvent();
++
+         if (bits & MAIN_EVENT_ERROR) {
++            generated_resume_allowed_.store(false);
++            StopLocalPlayback();
+             if (GetDeviceState() == kDeviceStateNotifying) {
+                 StopNotification();
+             }
+@@ -249,6 +276,8 @@
+ 
+         if (bits & MAIN_EVENT_SEND_AUDIO) {
+             while (auto packet = audio_service_.PopPacketFromSendQueue()) {
++                if (generated_audio_session_.load())
++                    continue;
+                 if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
+                     // Drop the remaining packets. Leaving them in the queue would
+                     // stall the Opus codec task (it waits for queue space), which in
+@@ -328,6 +357,8 @@
+ }
+ 
+ void Application::HandleNetworkDisconnectedEvent() {
++    generated_resume_allowed_.store(false);
++    StopLocalPlayback();
+     // Close current conversation when network disconnected
+     auto state = GetDeviceState();
+     if (state == kDeviceStateNotifying) {
+@@ -572,12 +603,13 @@
+     protocol_->OnConnected([this]() { DismissAlert(); });
+ 
+     protocol_->OnNetworkError([this](const std::string& message) {
++        generated_resume_allowed_.store(false);
+         last_error_message_ = message;
+         xEventGroupSetBits(event_group_, MAIN_EVENT_ERROR);
+     });
+ 
+     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
+-        if (GetDeviceState() == kDeviceStateSpeaking) {
++        if (!generated_audio_session_.load() && GetDeviceState() == kDeviceStateSpeaking) {
+             audio_service_.PushPacketToDecodeQueue(std::move(packet));
+         }
+     });
+@@ -593,8 +625,10 @@
+     });
+ 
+     protocol_->OnAudioChannelClosed([this, &board]() {
++        const auto epoch = generated_audio_epoch_.load();
+         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+-        Schedule([this]() {
++        Schedule([this, epoch]() {
++            if (generated_audio_session_.load() || generated_audio_epoch_.load() != epoch) return;
+             auto display = Board::GetInstance().GetDisplay();
+             display->SetChatMessage("system", "");
+             SetDeviceState(kDeviceStateIdle);
+@@ -642,17 +676,26 @@
+                 StartNotification(std::move(url), std::move(subtitles));
+             });
+         } else if (strcmp(type->valuestring, "tts") == 0) {
++            if (generated_audio_session_.load())
++                return;
++            const auto generated_epoch = generated_audio_epoch_.load();
+             auto state = cJSON_GetObjectItem(root, "state");
+             if (!cJSON_IsString(state)) {
+                 return;
+             }
+             if (strcmp(state->valuestring, "start") == 0) {
+-                Schedule([this]() {
++                Schedule([this, generated_epoch]() {
++                    if (generated_audio_session_.load() || local_awaiting_user_.load() ||
++                        generated_audio_epoch_.load() != generated_epoch)
++                        return;
+                     aborted_ = false;
+                     SetDeviceState(kDeviceStateSpeaking);
+                 });
+             } else if (strcmp(state->valuestring, "stop") == 0) {
+-                Schedule([this]() {
++                Schedule([this, generated_epoch]() {
++                    if (generated_audio_session_.load() || local_awaiting_user_.load() ||
++                        generated_audio_epoch_.load() != generated_epoch)
++                        return;
+                     if (GetDeviceState() == kDeviceStateSpeaking) {
+                         if (listening_mode_ == kListeningModeManualStop) {
+                             SetDeviceState(kDeviceStateIdle);
+@@ -670,8 +713,10 @@
+                         glyphs.clear();
+                     }
+                     ESP_LOGI(TAG, "<< %s", text->valuestring);
+-                    Schedule([display, message = std::string(text->valuestring),
++                    Schedule([this, display, message = std::string(text->valuestring), generated_epoch,
+                               glyphs = std::move(glyphs), bpp]() {
++                        if (generated_audio_session_.load() || local_awaiting_user_.load() ||
++                            generated_audio_epoch_.load() != generated_epoch) return;
+                         display->AddTextGlyphs(glyphs, bpp);
+                         display->SetChatMessage("assistant", message.c_str());
+                     });
+@@ -680,14 +725,18 @@
+         } else if (strcmp(type->valuestring, "stt") == 0) {
+             auto text = cJSON_GetObjectItem(root, "text");
+             if (cJSON_IsString(text)) {
++                if (generated_audio_session_.load()) return;
++                const auto epoch = generated_audio_epoch_.load();
+                 std::vector<TextGlyph> glyphs;
+                 uint8_t bpp = 0;
+                 if (!TextGlyphPayload::Parse(root, glyphs, bpp)) {
+                     glyphs.clear();
+                 }
+                 ESP_LOGI(TAG, ">> %s", text->valuestring);
+-                Schedule([display, message = std::string(text->valuestring),
++                Schedule([this, display, epoch, message = std::string(text->valuestring),
+                           glyphs = std::move(glyphs), bpp]() {
++                    if (generated_audio_session_.load() || generated_audio_epoch_.load() != epoch) return;
++                    HandleLocalUserText(message, epoch);
+                     display->AddTextGlyphs(glyphs, bpp);
+                     display->SetChatMessage("user", message.c_str());
+                 });
+@@ -803,6 +852,10 @@
+ void Application::StopListening() { xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LISTENING); }
+ 
+ void Application::HandleToggleChatEvent() {
++    if (generated_audio_session_.load()) {
++        StopLocalPlayback();
++        return;
++    }
+     auto state = GetDeviceState();
+ 
+     if (state == kDeviceStateNotifying) {
+@@ -867,6 +920,10 @@
+ }
+ 
+ void Application::HandleStartListeningEvent() {
++    if (generated_audio_session_.load()) {
++        StopLocalPlayback();
++        return;
++    }
+     auto state = GetDeviceState();
+ 
+     if (state == kDeviceStateNotifying) {
+@@ -903,6 +960,14 @@
+ }
+ 
+ void Application::HandleStopListeningEvent() {
++    generated_resume_allowed_.store(false);
++    if (generated_audio_session_.load()) { StopLocalPlayback(); return; }
++    if (GetDeviceState() == kDeviceStateConnecting && local_awaiting_user_.load()) {
++        SetDeviceState(kDeviceStateIdle);
++        audio_service_.EnableVoiceProcessing(false);
++        audio_service_.EnableWakeWordDetection(true);
++        return;
++    }
+     auto state = GetDeviceState();
+ 
+     if (state == kDeviceStateNotifying) {
+@@ -920,6 +985,8 @@
+ }
+ 
+ void Application::HandleWakeWordDetectedEvent() {
++    if (generated_audio_session_.load())
++        return;
+     if (!protocol_) {
+         return;
+     }
+@@ -1028,6 +1095,12 @@
+     auto display = board.GetDisplay();
+     auto led = board.GetLed();
+     led->OnStateChanged();
++    if (generated_audio_session_.load()) {
++        audio_service_.EnableVoiceProcessing(false);
++        audio_service_.EnableWakeWordDetection(false);
++        display->SetStatus("Local sound - button stops");
++        return;
++    }
+ 
+     switch (new_state) {
+         case kDeviceStateUnknown:
+@@ -1164,13 +1237,28 @@
+ void Application::StartListeningAudio() {
+     // Runs in the main loop, either directly from HandleStateChangedEvent or
+     // deferred via MAIN_EVENT_PLAYBACK_DRAINED once the playback queue drains.
+-    if (GetDeviceState() != kDeviceStateListening) {
+-        return;
+-    }
+-
++    if (generated_audio_session_.load() || GetDeviceState() != kDeviceStateListening) {
++        return;
++    }
++
++    if (!protocol_ || !protocol_->IsAudioChannelOpened() ||
++        (local_awaiting_user_.load() && !generated_resume_allowed_.load())) {
++        SetDeviceState(kDeviceStateIdle);
++        audio_service_.EnableVoiceProcessing(false);
++        audio_service_.EnableWakeWordDetection(true);
++        return;
++    }
++    if (local_awaiting_user_.load() && audio_service_.IsAudioProcessorRunning()) return;
+     // Send the start listening command
+     protocol_->SendStartListening(listening_mode_);
+-    audio_service_.EnableVoiceProcessing(true);
++    if (!local_awaiting_user_.load() || generated_resume_allowed_.load())
++        audio_service_.EnableVoiceProcessing(true);
++    if (local_awaiting_user_.load() && !generated_resume_allowed_.load()) {
++        audio_service_.EnableVoiceProcessing(false);
++        audio_service_.EnableWakeWordDetection(true);
++        SetDeviceState(kDeviceStateIdle);
++        return;
++    }
+ 
+     ConfigureWakeWordForListening();
+ 
+@@ -1192,7 +1280,8 @@
+ }
+ 
+ void Application::StartNotification(std::string audio_url, std::vector<NotifySubtitle> subtitles) {
+-    if (GetDeviceState() != kDeviceStateIdle || notify_player_.IsBusy()) {
++    if (generated_audio_session_.load() || GetDeviceState() != kDeviceStateIdle ||
++        notify_player_.IsBusy()) {
+         ESP_LOGW(TAG, "Ignoring notify message while device is busy");
+         return;
+     }
+@@ -1454,6 +1543,8 @@
+ 
+ void Application::ResetProtocol() {
+     Schedule([this]() {
++        generated_resume_allowed_.store(false);
++        StopLocalPlayback();
+         if (GetDeviceState() == kDeviceStateNotifying) {
+             StopNotification();
+         }
+--- a/main/application.h
++++ b/main/application.h
+@@ -17,6 +17,7 @@
+ #include "protocol.h"
+ #include "ota.h"
+ #include "audio_service.h"
++#include "local_audio_session.h"
+ #include "device_state.h"
+ #include "device_state_machine.h"
+ #include "notify/notify_player.h"
+@@ -37,6 +38,7 @@
+ #define MAIN_EVENT_STATE_CHANGED        (1 << 12)
+ #define MAIN_EVENT_PLAYBACK_DRAINED     (1 << 13)
+ #define MAIN_EVENT_STARTUP_HINT_TIMEOUT (1 << 14)
++#define MAIN_EVENT_GENERATED_AUDIO (1 << 15)
+ 
+ enum AecMode {
+     kAecOff,
+@@ -118,7 +120,11 @@
+     AecMode GetAecMode() const { return aec_mode_; }
+     void PlaySound(const std::string_view& sound);
+     AudioService& GetAudioService() { return audio_service_; }
+-    
++    std::string RequestLocalPlayback(local_audio::Source& source,
++        std::function<bool(uint32_t, uint32_t)> configure);
++    std::string StopLocalPlayback(local_audio::Source* expected = nullptr);
++    std::string LocalPlaybackStatus(const local_audio::Source& source);
++
+     /**
+      * Reset protocol resources (thread-safe)
+      * Can be called from any task to release resources allocated after network connected
+@@ -142,6 +148,31 @@
+     std::string last_error_message_;
+     std::string startup_wake_word_hint_message_;
+     AudioService audio_service_;
++    std::mutex generated_command_mutex_;
++    uint32_t generated_request_id_ = 0;
++    bool generated_command_pending_ = false;
++    bool generated_stop_pending_ = false;
++    std::atomic<bool> generated_audio_session_{false};
++    std::atomic<uint32_t> generated_audio_epoch_{0};
++    std::string generated_error_;
++    local_audio::Source* local_command_source_ = nullptr;
++    local_audio::Source* local_active_source_ = nullptr;
++    std::function<bool(uint32_t, uint32_t)> local_configure_;
++    void HandleLocalPlaybackEvent();
++    void ResumeListeningAfterLocalPlayback(uint32_t epoch);
++    void ObserveLocalVoiceActivity();
++    void ObserveLocalInputActivity(const std::vector<int16_t>& pcm);
++    std::atomic<uint32_t> local_fresh_voice_epoch_{UINT32_MAX};
++    uint32_t local_observed_input_epoch_ = UINT32_MAX;
++    local_audio::InputSpeechBoundary local_input_boundary_;
++    void HandleLocalUserText(const std::string& text, uint32_t epoch);
++    std::atomic<bool> generated_resume_allowed_{false};
++    std::atomic<bool> local_awaiting_user_{false};
++    bool generated_auto_listening_transition_ = false;
++    std::atomic<uint32_t> recognized_user_turn_{0};
++    std::atomic<uint32_t> finalized_user_turn_{UINT32_MAX};
++    uint64_t local_guard_text_ = 0, last_recognized_text_ = 0;
++    uint32_t last_recognized_turn_ = UINT32_MAX;
+     NotifyPlayer notify_player_;
+     uint32_t notification_playback_id_ = 0;
+     std::unique_ptr<Ota> ota_;
+--- a/main/audio/audio_codec.cc
++++ b/main/audio/audio_codec.cc
+@@ -14,8 +14,13 @@
+ AudioCodec::~AudioCodec() {
+ }
+ 
+-void AudioCodec::OutputData(std::vector<int16_t>& data) {
+-    Write(data.data(), data.size());
++void AudioCodec::OutputData(std::vector<int16_t>& data) { Write(data.data(), data.size()); }
++
++bool AudioCodec::OutputGeneratedData(std::vector<int16_t>& data) {
++    // Codecs must opt into a bounded, checked generated-output implementation.
++    // Ordinary OutputData behavior is unchanged.
++    (void)data;
++    return false;
+ }
+ 
+ bool AudioCodec::InputData(std::vector<int16_t>& data) {
+--- a/main/audio/audio_codec.h
++++ b/main/audio/audio_codec.h
+@@ -35,6 +35,7 @@
+     virtual void EnableOutput(bool enable);
+ 
+     virtual void OutputData(std::vector<int16_t>& data);
++    virtual bool OutputGeneratedData(std::vector<int16_t>& data);
+     virtual bool InputData(std::vector<int16_t>& data);
+     virtual void Start();
+ 
+--- a/main/audio/audio_service.cc
++++ b/main/audio/audio_service.cc
+@@ -85,6 +85,7 @@
+     audio_engine_ = std::make_unique<LiteAudioEngine>();
+ #endif
+     audio_engine_->OnOutput([this](std::vector<int16_t>&& data) {
++        if (callbacks_.on_input_activity) callbacks_.on_input_activity(data);
+         PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
+     });
+     audio_engine_->OnVadStateChange([this](bool speaking) {
+@@ -177,9 +178,13 @@
+                                          AS_EVENT_AUDIO_PROCESSOR_RUNNING);
+ 
+     bool notify_drained = false;
++    bool generated_stopped = false;
+     {
+         std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+         ++playback_generation_;
++        generated_stopped = local_source_ != nullptr;
++        if (local_source_) local_source_->Fail();
++        local_source_ = nullptr;
+         audio_encode_queue_.clear();
+         audio_decode_queue_.clear();
+         audio_playback_queue_.clear();
+@@ -190,6 +195,8 @@
+     if (notify_drained && callbacks_.on_playback_drained) {
+         callbacks_.on_playback_drained();
+     }
++    if (generated_stopped && callbacks_.on_local_audio_finished)
++        callbacks_.on_local_audio_finished();
+ }
+ 
+ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples) {
+@@ -324,14 +331,52 @@
+ }
+ 
+ void AudioService::AudioOutputTask() {
++    // Reused bounded buffer; no duration-sized storage or extra RTOS task.
++    std::vector<int16_t> generated_pcm(240);
+     while (true) {
+         std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+-        audio_queue_cv_.wait(
+-            lock, [this]() { return !audio_playback_queue_.empty() || service_stopped_.load(); });
++        audio_queue_cv_.wait(lock, [this]() {
++            return (local_source_ && local_source_->active()) || !audio_playback_queue_.empty() ||
++                   service_stopped_.load();
++        });
+         if (service_stopped_.load()) {
+             break;
+         }
+ 
++        if ((local_source_ && local_source_->active())) {
++            generated_pcm.resize(240);
++            generated_pcm.resize(
++                local_source_->Render(generated_pcm.data(), generated_pcm.size()));
++            auto* source = local_source_;
++            const auto source_epoch = local_source_epoch_;
++            output_in_flight_ = true;
++            bool write_ok = !generated_pcm.empty() || !source->active();
++            lock.unlock();
++            if (!generated_pcm.empty()) {
++                if (!codec_->output_enabled()) {
++                    esp_timer_stop(audio_power_timer_);
++                    esp_timer_start_periodic(audio_power_timer_,
++                                             AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
++                }
++                write_ok = codec_->OutputGeneratedData(generated_pcm);
++                last_output_time_ = std::chrono::steady_clock::now();
++            }
++            lock.lock();
++            output_in_flight_ = false;
++            if (local_source_ == source && local_source_epoch_ == source_epoch) {
++                if (write_ok) source->Commit();
++                else source->Fail();
++            }
++            const bool finished = !local_source_ || !local_source_->active();
++            const bool drained = MarkPlaybackDrainedLocked();
++            audio_queue_cv_.notify_all();
++            lock.unlock();
++            if (finished && callbacks_.on_local_audio_finished)
++                callbacks_.on_local_audio_finished();
++            if (drained && callbacks_.on_playback_drained)
++                callbacks_.on_playback_drained();
++            continue;
++        }
+         auto task = std::move(audio_playback_queue_.front());
+         audio_playback_queue_.pop_front();
+         output_in_flight_ = true;
+@@ -449,7 +494,8 @@
+             }
+ 
+             lock.lock();
+-            if (decoded && generation == playback_generation_ && !service_stopped_.load()) {
++            if (decoded && generation == playback_generation_ && !service_stopped_.load() &&
++                !local_source_) {
+                 audio_playback_queue_.push_back(std::move(task));
+             }
+             decode_in_flight_ = false;
+@@ -608,6 +654,8 @@
+ 
+ bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait) {
+     std::unique_lock<std::mutex> lock(audio_queue_mutex_);
++    if (local_source_)
++        return false;
+     const uint32_t generation = playback_generation_;
+     if (audio_decode_queue_.size() >= MAX_DECODE_PACKETS_IN_QUEUE) {
+         if (wait) {
+@@ -822,8 +870,8 @@
+ }
+ 
+ bool AudioService::IsPlaybackDrainedLocked() const {
+-    return audio_decode_queue_.empty() && audio_playback_queue_.empty() && !decode_in_flight_ &&
+-           !output_in_flight_;
++    return !local_source_ && audio_decode_queue_.empty() &&
++           audio_playback_queue_.empty() && !decode_in_flight_ && !output_in_flight_;
+ }
+ 
+ bool AudioService::MarkPlaybackDrainedLocked() {
+@@ -883,3 +931,49 @@
+     audio_engine_->EnableDeviceAec(device_aec_enabled_);
+     return true;
+ }
++
++// Shared output ownership, independent of algorithms and optional feature assets.
++bool AudioService::ControlLocalAudio(local_audio::Source& source,
++                                     const std::function<bool()>& update) {
++    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
++    if (service_stopped_.load() || (local_source_ && local_source_ != &source) || !update())
++        return false;
++    if (local_source_ != &source) ++local_source_epoch_;
++    local_source_ = &source;
++    ++playback_generation_;
++    audio_decode_queue_.clear();
++    audio_playback_queue_.clear();
++    audio_testing_queue_.clear();
++    playback_drained_notified_ = false;
++    audio_queue_cv_.notify_all();
++    return true;
++}
++void AudioService::StopLocalAudio(local_audio::Source* expected) {
++    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
++    if (local_source_ && (!expected || local_source_ == expected)) local_source_->Stop();
++    audio_queue_cv_.notify_all();
++}
++bool AudioService::IsLocalAudioActive() {
++    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
++    return local_source_ && (local_source_->active() || output_in_flight_);
++}
++bool AudioService::LocalAudioFailed() {
++    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
++    return local_source_ && local_source_->failed();
++}
++std::string AudioService::LocalAudioStatus(const local_audio::Source& source) {
++    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
++    return source.StatusJson();
++}
++void AudioService::ReleaseLocalAudio(local_audio::Source* expected) {
++    bool drained = false;
++    {
++        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
++        if (expected && local_source_ != expected) return;
++        if (local_source_ && (local_source_->active() || output_in_flight_)) return;
++        local_source_ = nullptr;
++        drained = MarkPlaybackDrainedLocked();
++        audio_queue_cv_.notify_all();
++    }
++    if (drained && callbacks_.on_playback_drained) callbacks_.on_playback_drained();
++}
+--- a/main/audio/audio_service.h
++++ b/main/audio/audio_service.h
+@@ -24,6 +24,7 @@
+ #include "fixed_queue.h"
+ #include "ogg_demuxer.h"
+ #include "protocol.h"
++#include "local_audio_source.h"
+ 
+ /*
+  * There are two types of audio data flow:
+@@ -83,9 +84,11 @@
+     std::function<void(void)> on_send_queue_available;
+     std::function<void(const std::string&)> on_wake_word_detected;
+     std::function<void(bool)> on_vad_change;
++    std::function<void(const std::vector<int16_t>&)> on_input_activity;
+     std::function<void(void)> on_audio_testing_queue_full;
+     // Fired when the decode/playback queues and their in-flight work are drained.
+     std::function<void(void)> on_playback_drained;
++    std::function<void(void)> on_local_audio_finished;
+     std::function<void(uint32_t playback_id, uint32_t media_position_ms)> on_playback_progress;
+ };
+ 
+@@ -148,6 +151,14 @@
+     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
+     void ResetDecoder();
+     void SetModelsList(srmodel_list_t* models_list);
++    // Shared host glue: independent producers use this once-installed contract.
++    // update runs under the output queue mutex; a different owner is rejected.
++    bool ControlLocalAudio(local_audio::Source& source, const std::function<bool()>& update);
++    void StopLocalAudio(local_audio::Source* expected = nullptr);
++    void ReleaseLocalAudio(local_audio::Source* expected = nullptr);
++    bool IsLocalAudioActive();
++    bool LocalAudioFailed();
++    std::string LocalAudioStatus(const local_audio::Source& source);
+ 
+ private:
+     AudioCodec* codec_ = nullptr;
+@@ -195,6 +206,8 @@
+     bool output_in_flight_ = false;
+     bool playback_drained_notified_ = true;
+     uint32_t playback_generation_ = 0;
++    local_audio::Source* local_source_ = nullptr;
++    uint32_t local_source_epoch_ = 0;
+     // For server AEC
+     FixedQueue<uint32_t, MAX_TIMESTAMPS_IN_QUEUE> timestamp_queue_;
+ 
+--- a/main/audio/codecs/no_audio_codec.cc
++++ b/main/audio/codecs/no_audio_codec.cc
+@@ -1,4 +1,8 @@
+ #include "no_audio_codec.h"
++#include <chrono>
++#include <cstdlib>
++#include <memory>
++#include <esp_timer.h>
+ 
+ #include <esp_log.h>
+ #include <cmath>
+@@ -215,8 +219,44 @@
+     ESP_LOGI(TAG, "Simplex channels created");
+ }
+ 
++bool NoAudioCodec::OutputGeneratedData(std::vector<int16_t>& data) {
++    if (data.empty()) return true;
++    if (data.size() > 240) return false;
++    // Full-frame conversion, deliberately not a persistent/chunked scratch buffer.
++    // This deadline covers waiting for the shared I2S lock and the driver call.
++    constexpr int64_t kDeadlineUs = 100000;
++    const int64_t start = esp_timer_get_time();
++    std::unique_lock<std::timed_mutex> lock(data_if_mutex_, std::defer_lock);
++    if (!lock.try_lock_for(std::chrono::milliseconds(100))) return false;
++    if (!output_enabled_) {
++        // All TX handle operations share data_if_mutex_; after acquiring it,
++        // the pinned driver's internal channel mutex has no competing owner.
++        // Do not call ordinary EnableOutput (unbounded lock/fatal error policy).
++        if (esp_timer_get_time() - start >= kDeadlineUs ||
++            i2s_channel_enable(tx_handle_) != ESP_OK) return false;
++        output_enabled_ = true;
++        if (esp_timer_get_time() - start >= kDeadlineUs) return false;
++    }
++    std::unique_ptr<int32_t, decltype(&std::free)> buffer(
++        static_cast<int32_t*>(std::malloc(data.size() * sizeof(int32_t))), &std::free);
++    if (!buffer) return false;
++    const int64_t volume = int64_t(output_volume_) * output_volume_ * 65536 / 10000;
++    for (size_t i = 0; i < data.size(); ++i) {
++        int64_t sample = int64_t(data[i]) * volume;
++        buffer.get()[i] = sample > INT32_MAX ? INT32_MAX :
++                          sample < INT32_MIN ? INT32_MIN : static_cast<int32_t>(sample);
++    }
++    const int64_t remaining = kDeadlineUs - (esp_timer_get_time() - start);
++    if (remaining <= 0) return false;
++    size_t written = 0;
++    const auto result = i2s_channel_write(tx_handle_, buffer.get(), data.size() * sizeof(int32_t),
++                                        &written, static_cast<uint32_t>(remaining / 1000));
++    return result == ESP_OK && written == data.size() * sizeof(int32_t) &&
++           esp_timer_get_time() - start <= kDeadlineUs;
++}
++
+ int NoAudioCodec::Write(const int16_t* data, int samples) {
+-    std::lock_guard<std::mutex> lock(data_if_mutex_);
++    std::lock_guard<std::timed_mutex> lock(data_if_mutex_);
+     std::vector<int32_t> buffer(samples);
+ 
+     // output_volume_: 0-100
+@@ -256,7 +296,7 @@
+ }
+ 
+ void NoAudioCodec::EnableInput(bool enable) {
+-    std::lock_guard<std::mutex> lock(data_if_mutex_);
++    std::lock_guard<std::timed_mutex> lock(data_if_mutex_);
+     if (enable == input_enabled_) {
+         return;
+     }
+@@ -269,7 +309,7 @@
+ }
+ 
+ void NoAudioCodec::EnableOutput(bool enable) {
+-    std::lock_guard<std::mutex> lock(data_if_mutex_);
++    std::lock_guard<std::timed_mutex> lock(data_if_mutex_);
+     if (enable == output_enabled_) {
+         return;
+     }
+--- a/main/audio/codecs/no_audio_codec.h
++++ b/main/audio/codecs/no_audio_codec.h
+@@ -9,7 +9,7 @@
+ 
+ class NoAudioCodec : public AudioCodec {
+ protected:
+-    std::mutex data_if_mutex_;
++    std::timed_mutex data_if_mutex_;
+ 
+     virtual int Write(const int16_t* data, int samples) override;
+     virtual int Read(int16_t* dest, int samples) override;
+@@ -18,6 +18,7 @@
+ 
+ public:
+     virtual ~NoAudioCodec();
++    bool OutputGeneratedData(std::vector<int16_t>& data) override;
+ };
+ 
+ class NoAudioCodecDuplex : public NoAudioCodec {

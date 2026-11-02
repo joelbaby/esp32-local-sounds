@@ -1,0 +1,39 @@
+{
+  "package_version": "0.1.0",
+  "xiaozhi": {
+    "repository": "https://github.com/78/xiaozhi-esp32",
+    "version": "2.5.3",
+    "commit": "addb1ed59bd71e09a6a5e0c52ad2f1c474aa8ca1",
+    "dependencies_lock_sha256": "17002dda8f550d46f2d1890a62fb4c6f24326354f8dbfa036f2a1f2b503f33b8"
+  },
+  "esp_idf": {
+    "repository": "https://github.com/espressif/esp-idf",
+    "version": "6.1 development snapshot",
+    "commit": "9a97f6c54ec638111ce55cd36581b3c192f15207",
+    "existing_sdk_caveat": "Shared SDK has pre-existing optional lwIP diagnostics changes. Their feature guards are disabled and no diagnostics symbols are linked. No SDK source was changed by this package."
+  },
+  "toolchain": {
+    "riscv32-esp-elf": "esp-15.2.0_20251204 / GCC 15.2.0",
+    "cmake": "4.0.3",
+    "ninja": "1.12.1",
+    "python": "3.12.3",
+    "host_cxx": "Ubuntu GCC 13.3.0"
+  },
+  "tested_firmware_configuration": {
+    "target": "esp32c3",
+    "board": "pocket-sounds-c3",
+    "variant": "pocket-sounds-c3-4mb",
+    "language": "en-US",
+    "wake_word": "hiesp",
+    "pcm_waiting_frames": 2,
+    "compressed_decode_packets": 20,
+    "otto_enabled": false,
+    "private_feature_enabled": false
+  },
+  "compatibility": {
+    "otto": "source installer transactions verified; combined firmware build/hardware untested",
+    "older_future_xiaozhi": "untested, installer refuses unknown revisions",
+    "other_codecs": "generated output safely unsupported until bounded implementation is supplied",
+    "hardware": "not flashed or tested"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "board": {
+    "main/CMakeLists.txt": {
+      "before": [
+        "df37a0a9937780223f972e1a1884d01118b870a63fb6c9ced6e26116b93d5426"
+      ]
+    },
+    "main/Kconfig.projbuild": {
+      "before": [
+        "0d453e08ca6dd8ff21f2c5b94677290f1a8d1ab46288c6856f4f4f2a6d101a2e"
+      ]
+    },
+    "main/application.cc": {
+      "before": [
+        "452f87692581fa44c44f1f6e027d14911c397af39dca9e9200b543157acfd7f9"
+      ]
+    }
+  }
+}

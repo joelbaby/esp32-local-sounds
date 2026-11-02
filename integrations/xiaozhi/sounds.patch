@@ -1,0 +1,52 @@
+--- a/main/CMakeLists.txt
++++ b/main/CMakeLists.txt
+@@ -2,7 +2,10 @@
+ set(SOURCES "audio/audio_codec.cc"
+             "audio/audio_debugger.cc"
+             "audio/audio_service.cc"
++            "audio/tone_noise_generator.cc"
+             "audio/local_audio_adapter.cc"
++            "audio/generated_audio_adapter.cc"
++            "audio/generated_audio_tools.cc"
+             "audio/demuxer/ogg_demuxer.cc"
+             "notify/notify_player.cc"
+             "audio/codecs/no_audio_codec.cc"
+--- a/main/application.cc
++++ b/main/application.cc
+@@ -130,6 +130,8 @@
+     // Add MCP common tools (only once during initialization)
+     auto& mcp_server = McpServer::GetInstance();
+     mcp_server.AddCommonTools();
++    extern void RegisterGeneratedAudioTools(McpServer&);
++    RegisterGeneratedAudioTools(mcp_server);
+     mcp_server.AddUserOnlyTools();
+     // Registration is complete here, so this is the only place the whole inventory exists.
+     // It is logged because a server that accepts a bounded number of tools drops the rest
+--- a/main/application.h
++++ b/main/application.h
+@@ -17,6 +17,7 @@
+ #include "protocol.h"
+ #include "ota.h"
+ #include "audio_service.h"
++#include "tone_noise_generator.h"
+ #include "local_audio_session.h"
+ #include "device_state.h"
+ #include "device_state_machine.h"
+@@ -124,6 +125,9 @@
+         std::function<bool(uint32_t, uint32_t)> configure);
+     std::string StopLocalPlayback(local_audio::Source* expected = nullptr);
+     std::string LocalPlaybackStatus(const local_audio::Source& source);
++    std::string RequestGeneratedAudio(const tone_noise::Parameters& parameters);
++    std::string StopGeneratedAudio();
++    std::string GeneratedAudioStatus();
+ 
+     /**
+      * Reset protocol resources (thread-safe)
+@@ -149,6 +153,7 @@
+     std::string startup_wake_word_hint_message_;
+     AudioService audio_service_;
+     std::mutex generated_command_mutex_;
++    tone_noise::Playback generated_playback_;
+     uint32_t generated_request_id_ = 0;
+     bool generated_command_pending_ = false;
+     bool generated_stop_pending_ = false;

@@ -1,0 +1,9 @@
+build/
+_build/
+__pycache__/
+*.pyc
+*.pcm
+*.wav
+*.elf
+*.bin
+.local-sounds-*.json

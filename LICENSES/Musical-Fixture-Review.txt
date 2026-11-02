@@ -1,0 +1,12 @@
+Musical fixture — separate composition rights
+
+src/axel_f_phrase.h contains a short Axel F-inspired phrase supplied by the user
+as 23 frequency/onset-interval events. The supplied pitches are retained. Onset rhythm is corrected from a licensed
+publisher preview at117BPM; gates/release and a local brass voice are approximate. This
+is an approximate rendition, not a verified transcription or recording sample.
+
+The composition/melody is not included in the implementation's MIT license.
+No ownership, public-domain status, musical copyright clearance or permission to
+publish/distribute the musical material is claimed. Distribution of this source does not grant a license to the composition.
+Consumers must establish the musical permissions appropriate to their use. Generic synthesis, sequencing implementation, generated waveform
+tables and tests are MIT; the separately marked musical fixture is excluded.
